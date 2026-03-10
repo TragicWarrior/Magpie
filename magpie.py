@@ -74,11 +74,189 @@ def estimate_soc(voltage, current, resistance, is_discharging):
 
     return (0, is_compensated)
 
+
+class ParseError(Exception):
+    """Raised when expected data cannot be parsed from the inverter page."""
+    pass
+
+
+def fetch_inverter_data(url):
+    """
+    Fetch and parse inverter data from the Magnum Energy web interface.
+
+    Args:
+        url: URL of the inverter data page
+
+    Returns:
+        Dict with keys: dc_volts_min, dc_volts_max, dc_volts_avg,
+                        dc_volts, dc_amps, dc_watts,
+                        ac_out, ac_in, system_state
+
+    Raises:
+        ParseError: If any expected data field cannot be extracted
+        requests.RequestException: On network errors
+    """
+    response = requests.get(url, timeout=10)
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.content, 'html.parser')
+
+    # Parse DC volts min/avg/max
+    try:
+        dc_volts_row = soup.find('th', string='DC volts:')
+        tds = dc_volts_row.find_next_siblings('td')
+        dc_volts_min = float(re.findall(r"[-+]?[0-9]*\.?[0-9]+", tds[0].text.strip())[0])
+        dc_volts_max = float(re.findall(r"[-+]?[0-9]*\.?[0-9]+", tds[1].text.strip())[0])
+        dc_volts_avg = float(re.findall(r"[-+]?[0-9]*\.?[0-9]+", tds[2].text.strip())[0])
+    except (AttributeError, IndexError, ValueError) as e:
+        raise ParseError(f"Failed to parse DC volts min/avg/max: {e}")
+
+    # Parse current DC volts/amps/watts
+    try:
+        dc_volts_amps_watts = soup.find('span', id='i_dc_watts').text.strip()
+        dc_values = dc_volts_amps_watts.split('@')
+        dc_volts = float(re.findall(r"[-+]?[0-9]*\.?[0-9]+", dc_values[0].strip())[0])
+        dc_amps_watts = dc_values[1].strip().split('(')
+        dc_amps = float(re.findall(r"[-+]?[0-9]*\.?[0-9]+", dc_amps_watts[0])[0])
+        dc_watts = float(re.findall(r"[-+]?[0-9]*\.?[0-9]+", dc_amps_watts[1])[0])
+    except (AttributeError, IndexError, ValueError) as e:
+        raise ParseError(f"Failed to parse DC volts/amps/watts: {e}")
+
+    # Parse AC Out
+    try:
+        ac_out_data = soup.find('th', string='AC Out:').find_next_sibling('td').text.strip()
+        ac_out_match = re.search(r"@\s*([-+]?[0-9]*\.?[0-9]+)\s*amps", ac_out_data, re.IGNORECASE)
+        ac_out = ac_out_match.group(1) if ac_out_match else "Unknown"
+    except AttributeError:
+        ac_out = "Unknown"
+
+    # Parse AC In
+    try:
+        ac_in_data = soup.find('th', string='AC In:').find_next_sibling('td').text.strip()
+        ac_in_match = re.search(r"([-+]?[0-9]*\.?[0-9]+)\s*amps", ac_in_data, re.IGNORECASE)
+        ac_in = ac_in_match.group(1) if ac_in_match else "Unknown"
+    except AttributeError:
+        ac_in = "Unknown"
+
+    # Parse system state
+    try:
+        system_status = soup.find('td', id='iStatus').text.strip().lower()
+    except AttributeError as e:
+        raise ParseError(f"Failed to parse system status: {e}")
+
+    if 'inverting' in system_status:
+        system_state = "Inverting"
+    elif 'absorb' in system_status or 'charging' in system_status:
+        system_state = "Charging"
+    else:
+        system_state = "Unknown"
+
+    return {
+        'dc_volts_min': dc_volts_min,
+        'dc_volts_max': dc_volts_max,
+        'dc_volts_avg': dc_volts_avg,
+        'dc_volts': dc_volts,
+        'dc_amps': dc_amps,
+        'dc_watts': dc_watts,
+        'ac_out': ac_out,
+        'ac_in': ac_in,
+        'system_state': system_state,
+    }
+
+
+def scale_for_stacked(data, master_percentage):
+    """
+    Scale DC amps and watts for a stacked inverter configuration.
+
+    When the system is inverting, the master unit only reports its own share
+    of the total load. This scales up to the full system value.
+
+    Args:
+        data: Dict from fetch_inverter_data()
+        master_percentage: Fraction representing the master's share (1/num_inverters)
+
+    Returns:
+        New dict with scaled dc_amps and dc_watts if inverting
+    """
+    result = dict(data)
+    if result['system_state'] == "Inverting":
+        result['dc_amps'] = data['dc_amps'] / master_percentage
+        result['dc_watts'] = data['dc_watts'] / master_percentage
+    return result
+
+
+def build_table(data, args):
+    """
+    Build a PrettyTable displaying inverter metrics with color-coded values.
+
+    Args:
+        data: Dict from fetch_inverter_data() (after scaling)
+        args: Parsed command-line arguments
+
+    Returns:
+        PrettyTable ready to print
+    """
+    dc_volts = data['dc_volts']
+
+    # Color-code current DC volts
+    if dc_volts < 51:
+        current_dc_volts = colored(f"{dc_volts}", "red")
+    elif dc_volts < 52:
+        current_dc_volts = colored(f"{dc_volts}", "yellow")
+    else:
+        current_dc_volts = colored(f"{dc_volts}", "green")
+
+    # Compute and color-code avg cell volts
+    avg_cell_volts = dc_volts / 16
+    if avg_cell_volts >= 3.3:
+        avg_cell_volts_display = colored(f"{avg_cell_volts:.2f}", "green")
+    elif avg_cell_volts >= 3.2:
+        avg_cell_volts_display = colored(f"{avg_cell_volts:.2f}", "yellow")
+    else:
+        avg_cell_volts_display = colored(f"{avg_cell_volts:.2f}", "red")
+
+    table = PrettyTable()
+    table.field_names = ["Parameter", "Value"]
+    table.add_row(["Min DC Volts (24h)", f"{data['dc_volts_min']}"])
+    table.add_row(["Avg DC Volts (24h)", f"{data['dc_volts_avg']}"])
+    table.add_row(["Max DC Volts (24h)", f"{data['dc_volts_max']}"])
+    table.add_row(["Current DC Volts", current_dc_volts])
+    table.add_row(["Current DC Amps", f"{data['dc_amps']:.2f}"])
+    table.add_row(["Current DC Watts", f"{data['dc_watts']:.2f}"])
+    table.add_row(["Avg Cell Volts", avg_cell_volts_display])
+    table.add_row(["AC Out (amps)", data['ac_out']])
+    table.add_row(["AC In (amps)", data['ac_in']])
+    table.add_row(["System State", data['system_state']])
+
+    # SoC estimation (only if capacity was specified)
+    if args.capacity is not None:
+        is_discharging = data['system_state'] == "Inverting"
+        soc, is_compensated = estimate_soc(dc_volts, data['dc_amps'], args.resistance, is_discharging)
+
+        if soc >= 50:
+            soc_display = colored(f"{soc:.0f}%", "green")
+        elif soc >= 20:
+            soc_display = colored(f"{soc:.0f}%", "yellow")
+        else:
+            soc_display = colored(f"{soc:.0f}%", "red")
+
+        if is_compensated:
+            soc_display += " (load-compensated)"
+        elif is_discharging:
+            soc_display += " (resting)"
+
+        table.add_row(["Estimated SoC", soc_display])
+
+    return table
+
+
 # Calculate master percentage based on number of inverters
 master_percentage = 1.0 / args.num_inverters
 
 # URL to fetch data from
 url = "http://data.magnumenergy.com/MW6181/"
+
+MAX_CONSECUTIVE_FAILURES = 5
 
 # Flag to control the loop
 stop_thread = False
@@ -107,127 +285,22 @@ if not args.report:
     quit_thread.start()
 
 try:
+    consecutive_failures = 0
+
     while not stop_thread:
         try:
-            # Fetch page
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
+            data = fetch_inverter_data(url)
+            data = scale_for_stacked(data, master_percentage)
+            table = build_table(data, args)
 
-            # Parse the page using BeautifulSoup
-            soup = BeautifulSoup(response.content, 'html.parser')
+            consecutive_failures = 0
 
-            # Find relevant elements for DC volts
-            try:
-                dc_volts_min = float(re.findall(r"[-+]?[0-9]*\.?[0-9]+", soup.find('th', string='DC volts:').find_next_sibling('td').text.strip())[0])
-                dc_volts_max = float(re.findall(r"[-+]?[0-9]*\.?[0-9]+", soup.find('th', string='DC volts:').find_next_sibling('td').find_next_sibling('td').text.strip())[0])
-                dc_volts_avg = float(re.findall(r"[-+]?[0-9]*\.?[0-9]+", soup.find('th', string='DC volts:').find_next_sibling('td').find_next_sibling('td').find_next_sibling('td').text.strip())[0])
-            except AttributeError:
-                print("Error finding the DC volts data on the page.")
-                continue
-
-            # Find relevant elements for DC volts/amps/watts (current values)
-            try:
-                dc_volts_amps_watts = soup.find('span', id='i_dc_watts').text.strip()
-                dc_values = dc_volts_amps_watts.split('@')
-                dc_volts = float(re.findall(r"[-+]?[0-9]*\.?[0-9]+", dc_values[0].strip())[0])
-                dc_amps_watts = dc_values[1].strip().split('(')
-
-                # Extract numeric values for amps and watts
-                dc_amps = float(re.findall(r"[-+]?[0-9]*\.?[0-9]+", dc_amps_watts[0])[0])
-                dc_watts = float(re.findall(r"[-+]?[0-9]*\.?[0-9]+", dc_amps_watts[1])[0])
-            except (AttributeError, IndexError, ValueError):
-                print("Error finding the DC volts/amps/watts data on the page.")
-                continue
-
-            # Find AC Out and AC In values (amps only)
-            try:
-                ac_out_data = soup.find('th', string='AC Out:').find_next_sibling('td').text.strip()
-                ac_out_match = re.search(r"@\s*([-+]?[0-9]*\.?[0-9]+)\s*amps", ac_out_data, re.IGNORECASE)
-                ac_out = ac_out_match.group(1) if ac_out_match else "Unknown"
-            except AttributeError:
-                ac_out = "Unknown"
-
-            try:
-                ac_in_data = soup.find('th', string='AC In:').find_next_sibling('td').text.strip()
-                ac_in_match = re.search(r"([-+]?[0-9]*\.?[0-9]+)\s*amps", ac_in_data, re.IGNORECASE)
-                ac_in = ac_in_match.group(1) if ac_in_match else "Unknown"
-            except AttributeError:
-                ac_in = "Unknown"
-
-            # Determine system state (Charging or Inverting)
-            system_status = soup.find('td', id='iStatus').text.strip().lower()
-            if 'inverting' in system_status:
-                system_state = "Inverting"
-            elif 'absorb' in system_status or 'charging' in system_status:
-                system_state = "Charging"
-            else:
-                system_state = "Unknown"
-
-            # Adjust amps and watts if the system is inverting
-            if system_state == "Inverting":
-                dc_amps /= master_percentage
-                dc_watts /= master_percentage
-
-            # Compute Avg Cell Volts
-            avg_cell_volts = dc_volts / 16
-            if avg_cell_volts >= 3.3:
-                avg_cell_volts_display = colored(f"{avg_cell_volts:.2f}", "green")
-            elif avg_cell_volts >= 3.2:
-                avg_cell_volts_display = colored(f"{avg_cell_volts:.2f}", "yellow")
-            else:
-                avg_cell_volts_display = colored(f"{avg_cell_volts:.2f}", "red")
-
-            # Clear the screen (only in continuous mode)
             if not args.report:
                 os.system('cls' if os.name == 'nt' else 'clear')
-
-                # Display message to quit
                 print("Press the [q] key to quit at anytime.\n")
-
-            # Display results in a unicode friendly table for terminal
-            table = PrettyTable()
-            table.field_names = ["Parameter", "Value"]
-            table.add_row(["Min DC Volts", f"{dc_volts_min}"])
-            table.add_row(["Avg DC Volts", f"{dc_volts_avg}"])
-            table.add_row(["Max DC Volts", f"{dc_volts_max}"])
-            if dc_volts < 51:
-                current_dc_volts = colored(f"{dc_volts}", "red")
-            elif dc_volts < 52:
-                current_dc_volts = colored(f"{dc_volts}", "yellow")
-            else:
-                current_dc_volts = colored(f"{dc_volts}", "green")
-            table.add_row(["Current DC Volts", current_dc_volts])
-            table.add_row(["Current DC Amps", f"{dc_amps:.2f}"])
-            table.add_row(["Current DC Watts", f"{dc_watts:.2f}"])
-            table.add_row(["Avg Cell Volts", avg_cell_volts_display])
-            table.add_row(["AC Out (amps)", ac_out])
-            table.add_row(["AC In (amps)", ac_in])
-            table.add_row(["System State", system_state])
-
-            # Calculate and display estimated SoC (only if capacity was specified)
-            if args.capacity is not None:
-                is_discharging = system_state == "Inverting"
-                soc, is_compensated = estimate_soc(dc_volts, dc_amps, args.resistance, is_discharging)
-
-                # Color code SoC based on level
-                if soc >= 50:
-                    soc_display = colored(f"{soc:.0f}%", "green")
-                elif soc >= 20:
-                    soc_display = colored(f"{soc:.0f}%", "yellow")
-                else:
-                    soc_display = colored(f"{soc:.0f}%", "red")
-
-                # Add indicator if load-compensated
-                if is_compensated:
-                    soc_display += " (load-compensated)"
-                elif is_discharging:
-                    soc_display += " (resting)"
-
-                table.add_row(["Estimated SoC", soc_display])
 
             print(table)
 
-            # Exit immediately if in report mode
             if args.report:
                 break
 
@@ -237,9 +310,17 @@ try:
                     break
                 time.sleep(1)
 
-        except requests.RequestException as e:
-            print(f"Error fetching the webpage: {e}")
-            time.sleep(5)
+        except (ParseError, requests.RequestException) as e:
+            consecutive_failures += 1
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                print(f"Too many consecutive failures ({consecutive_failures}). Exiting.")
+                break
+            delay = min(5 * (2 ** (consecutive_failures - 1)), 60)
+            print(f"Error ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}. Retrying in {delay}s...")
+            for _ in range(delay):
+                if stop_thread:
+                    break
+                time.sleep(1)
 
 except KeyboardInterrupt:
     print("Exiting program.")
